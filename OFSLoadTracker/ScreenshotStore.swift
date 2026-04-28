@@ -37,29 +37,35 @@ final class ScreenshotStore: ObservableObject {
         do {
             let size = image.size
             debug = "image \(Int(size.width))x\(Int(size.height))…"
-            let tokens = try await LTLOCR.recognize(image: image)
-            debug = "tokens: \(tokens.count)"
-            let clustered = LTLOCR.clusterRows(tokens)
-            debug = "tokens: \(tokens.count), rows: \(clustered.count)"
-            let parsed = LTLOCR.parseTable(clustered)
-            let ltlCount = parsed.filter(\.isLTL).count
-            debug = "tokens: \(tokens.count), rows: \(clustered.count), parsed: \(parsed.count), ltl: \(ltlCount)"
-            // Always log which rows were rejected by the LTL filter so we can
-            // see the carrier/PRO values that didn't pass.
-            let nonLTL = parsed.filter { !$0.isLTL }
-            if !nonLTL.isEmpty {
-                let preview = nonLTL.prefix(8).map {
-                    "  \($0.id) | carrier=\"\($0.carrierRaw)\" | pro=\"\($0.proNumber ?? "")\""
-                }.joined(separator: "\n")
-                lastError = "Rejected \(nonLTL.count) rows from LTL (showing first 8):\n\(preview)"
+
+            // Prefer Claude API if a key is configured — vision-model parsing
+            // beats Apple Vision + column-anchor heuristics on dense tables.
+            // Fall back to the local pipeline if Claude isn't available.
+            var parsed: [ScreenshotLoad] = []
+            var usedClaude = false
+            if APIKey.loadClaude() != nil {
+                debug = "calling Claude API…"
+                do {
+                    parsed = try await LTLClaudeOCR.parse(image: image)
+                    usedClaude = true
+                    debug = "Claude OCR: \(parsed.count) rows"
+                } catch {
+                    debug = "Claude OCR failed (\(error.localizedDescription)) — falling back to Vision"
+                }
             }
+            if !usedClaude {
+                let tokens = try await LTLOCR.recognize(image: image)
+                let clustered = LTLOCR.clusterRows(tokens)
+                parsed = LTLOCR.parseTable(clustered)
+                let ltlCount = parsed.filter(\.isLTL).count
+                debug += " — Vision: tokens \(tokens.count), rows \(clustered.count), parsed \(parsed.count), ltl \(ltlCount)"
+            }
+
             if parsed.isEmpty {
-                let preview = clustered.prefix(3).enumerated().map { (i, row) in
-                    "row\(i): " + row.map(\.text).joined(separator: " | ")
-                }.joined(separator: "\n")
-                lastError = "Header detection failed.\n\(preview)"
+                lastError = "No rows extracted from screenshot. \(debug)"
                 return
             }
+
             let newIDs = Set(parsed.map(\.id))
             let kept = rows.filter { !newIDs.contains($0.id) }
             rows = (kept + parsed).sorted { $0.id < $1.id }
