@@ -1,143 +1,157 @@
 import Foundation
 import AppKit
 
-/// Claude vision OCR for TMS screenshots. Replaces the prep-claude-ocr stub.
-/// Sends the screenshot to Anthropic's API and asks for a strict JSON array
-/// of `ScreenshotLoad` rows. `ScreenshotStore` falls back to Apple Vision if
-/// this throws.
+/// Claude vision OCR for TMS screenshots, via the local `claude` CLI.
+/// Uses Petee's Claude Pro/Max subscription (no Anthropic API key required).
+///
+/// Flow:
+///   1. Encode NSImage to a temp PNG.
+///   2. Shell out to `/opt/homebrew/bin/claude -p "<prompt with @path>"`.
+///   3. Parse the stdout JSON array into [ScreenshotLoad].
+///   4. Clean up the temp file.
+///
+/// `ScreenshotStore` falls back to Apple Vision (`LTLOCR`) if this throws.
 enum LTLClaudeOCR {
     enum Error: Swift.Error, LocalizedError {
-        case notConfigured
-        case missingAPIKey
+        case missingCLI
         case imageEncodingFailed
-        case requestFailed(status: Int, body: String)
+        case cliFailed(status: Int32, stderr: String)
         case malformedResponse(String)
 
         var errorDescription: String? {
             switch self {
-            case .notConfigured:
-                return "Claude OCR not yet integrated (stub)."
-            case .missingAPIKey:
-                return "No Anthropic API key found."
+            case .missingCLI:
+                return "Claude CLI not found. Install Claude Code (e.g. via Homebrew)."
             case .imageEncodingFailed:
-                return "Could not encode screenshot for upload."
-            case .requestFailed(let status, let body):
-                return "Claude API \(status): \(body.prefix(200))"
+                return "Could not encode screenshot for the CLI."
+            case .cliFailed(let status, let stderr):
+                return "claude CLI exited \(status): \(stderr.prefix(300))"
             case .malformedResponse(let detail):
-                return "Malformed Claude response: \(detail.prefix(200))"
+                return "Malformed Claude response: \(detail.prefix(300))"
             }
         }
     }
 
-    /// Sonnet 4.6 is the price/accuracy sweet spot for table extraction.
-    /// Override with `OFS_CLAUDE_MODEL` if you want Opus.
-    private static var model: String {
-        ProcessInfo.processInfo.environment["OFS_CLAUDE_MODEL"]
-            ?? "claude-sonnet-4-6"
+    /// Override with `OFS_CLAUDE_MODEL` if you want Opus, etc.
+    private static var modelOverride: String? {
+        let env = ProcessInfo.processInfo.environment["OFS_CLAUDE_MODEL"]
+        return (env?.isEmpty == false) ? env : nil
+    }
+
+    /// Override with `OFS_CLAUDE_PATH` if `claude` lives elsewhere.
+    private static var cliPath: String? {
+        if let env = ProcessInfo.processInfo.environment["OFS_CLAUDE_PATH"],
+           FileManager.default.isExecutableFile(atPath: env) {
+            return env
+        }
+        let candidates = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/claude"),
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     static func parse(image: NSImage) async throws -> [ScreenshotLoad] {
-        guard let key = APIKey.loadClaude() else { throw Error.missingAPIKey }
+        guard let cli = cliPath else { throw Error.missingCLI }
         guard let pngData = encodePNG(image, maxLongEdge: 1800) else {
             throw Error.imageEncodingFailed
         }
-        let base64 = pngData.base64EncodedString()
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ofs-ocr-\(UUID().uuidString).png")
+        try pngData.write(to: tmpURL)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
 
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 8000,
-            "messages": [[
-                "role": "user",
-                "content": [
-                    [
-                        "type": "image",
-                        "source": [
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": base64
-                        ]
-                    ],
-                    [
-                        "type": "text",
-                        "text": Self.prompt
-                    ]
-                ]
-            ]]
-        ]
-        let payload = try JSONSerialization.data(withJSONObject: body)
-
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.setValue(key, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.httpBody = payload
-        req.timeoutInterval = 90
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse else {
-            throw Error.malformedResponse("no HTTP response")
-        }
-        guard (200...299).contains(http.statusCode) else {
-            let bodyStr = String(data: data, encoding: .utf8) ?? "<no body>"
-            throw Error.requestFailed(status: http.statusCode, body: bodyStr)
+        // Build prompt. The @path tells claude to attach the PNG as image input.
+        let prompt = Self.buildPrompt(imagePath: tmpURL.path)
+        var args = ["-p", prompt, "--output-format", "text"]
+        if let model = modelOverride {
+            args.append(contentsOf: ["--model", model])
         }
 
-        let text = try extractText(data)
-        let jsonData = try extractJSONArray(text)
-        return try decodeLoads(jsonData)
+        let (status, stdout, stderr) = try await runProcess(
+            launchPath: cli,
+            arguments: args,
+            // Allow claude to read the temp file.
+            environment: nil,
+            timeout: 120
+        )
+        guard status == 0 else {
+            throw Error.cliFailed(status: status, stderr: stderr)
+        }
+        let arrayData = try extractJSONArray(stdout)
+        return try decodeLoads(arrayData)
     }
 
-    // MARK: - Encoding
+    // MARK: - Prompt
+
+    private static func buildPrompt(imagePath: String) -> String {
+        // Prepend @path so claude attaches the file as image input.
+        // Keep the structured-output instructions strict and quiet.
+        return """
+        @\(imagePath)
+
+        \(Self.basePrompt)
+        """
+    }
+
+    private static let basePrompt = """
+    You are an OCR assistant for an LTL/FTL freight Transportation Management System screenshot.
+    Extract every data row from the table in the image. Return ONLY a JSON array of objects.
+    Do not include commentary, markdown fences, or any other text.
+
+    Each row object must use these exact keys (use null when absent):
+      id              — 7-digit Load ID (string of digits)
+      status          — status text (e.g. "Delivered", "In Progress (Pickup)", "Covered", "Open")
+      carrierRaw      — full carrier string as shown (e.g. "Echo Logistics (Estes Express)")
+      proNumber       — PRO / tracking number, digits only (string), or null
+      pickupCity      — pickup city or null
+      pickupState     — pickup 2-letter state or null
+      dropCity        — drop city or null
+      dropState       — drop 2-letter state or null
+      shipper         — shipper name or null
+      consignee       — consignee name or null
+      pickupDate      — MM/DD/YY string from a "Pickup : MM/DD/YY (N items)" group header or row, or null
+      deliveryDate    — MM/DD/YY string or null
+      weight          — weight as shown (string, may include "lbs"), or null
+      customerCharges — customer charge amount as shown (string, may include "$"), or null
+      carrierCharges  — carrier charge amount as shown (string, may include "$"), or null
+
+    Output: a single JSON array with one object per data row. No prose. No code fences. No leading or trailing text.
+    """
+
+    // MARK: - PNG encoding
 
     private static func encodePNG(_ image: NSImage, maxLongEdge: CGFloat) -> Data? {
+        let size = image.size
+        let longest = max(size.width, size.height)
+        let scale = longest > maxLongEdge ? maxLongEdge / longest : 1.0
+        let newSize = NSSize(width: size.width * scale, height: size.height * scale)
+
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return nil
         }
-        let w = CGFloat(cg.width), h = CGFloat(cg.height)
-        let longEdge = max(w, h)
-        let scale = longEdge > maxLongEdge ? maxLongEdge / longEdge : 1.0
-        let targetW = max(1, Int((w * scale).rounded()))
-        let targetH = max(1, Int((h * scale).rounded()))
-
-        let colorSpace = cg.colorSpace ?? CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: targetW,
-            height: targetH,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
+        guard let colorSpace = cg.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                data: nil,
+                width: Int(newSize.width),
+                height: Int(newSize.height),
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
         ctx.interpolationQuality = .high
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
-        guard let resized = ctx.makeImage() else { return nil }
-        let rep = NSBitmapImageRep(cgImage: resized)
+        ctx.draw(cg, in: CGRect(origin: .zero, size: newSize))
+        guard let scaled = ctx.makeImage() else { return nil }
+        let rep = NSBitmapImageRep(cgImage: scaled)
         return rep.representation(using: .png, properties: [:])
     }
 
-    // MARK: - Response parsing
+    // MARK: - Response parsing (same shape as the old API version)
 
-    private static func extractText(_ data: Data) throws -> String {
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = obj["content"] as? [[String: Any]] else {
-            let raw = String(data: data, encoding: .utf8) ?? ""
-            throw Error.malformedResponse("no content array; raw: \(raw)")
-        }
-        var combined = ""
-        for block in content {
-            if (block["type"] as? String) == "text", let t = block["text"] as? String {
-                combined += t
-            }
-        }
-        if combined.isEmpty {
-            throw Error.malformedResponse("no text block in response")
-        }
-        return combined
-    }
-
-    /// Strip markdown fences and locate the outermost `[ ... ]` array.
     private static func extractJSONArray(_ text: String) throws -> Data {
         var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if let open = s.range(of: "```") {
@@ -150,7 +164,7 @@ enum LTLClaudeOCR {
         guard let start = s.firstIndex(of: "["),
               let end = s.lastIndex(of: "]"),
               start < end else {
-            throw Error.malformedResponse("no JSON array in: \(s.prefix(200))")
+            throw Error.malformedResponse("no JSON array in: \(s.prefix(300))")
         }
         let slice = String(s[start...end])
         guard let data = slice.data(using: .utf8) else {
@@ -214,36 +228,49 @@ enum LTLClaudeOCR {
         return nil
     }
 
-    private static let prompt = """
-    You are an OCR assistant for an LTL/FTL freight Transportation Management System screenshot.
-    Extract every data row from the table in the image. Return ONLY a JSON array of objects.
-    Do not include commentary, markdown fences, or any other text.
+    // MARK: - Process runner
 
-    Each row object must use these exact keys (use null when absent):
-      id              — 7-digit Load ID (string of digits)
-      status          — status text (e.g. "Delivered", "In Progress (Pickup)", "Covered", "Open")
-      carrierRaw      — full carrier string as shown (e.g. "Echo Logistics (Estes Express)")
-      proNumber       — PRO / tracking number, digits only (string), or null
-      pickupCity      — pickup city or null
-      pickupState     — pickup 2-letter state or null
-      dropCity        — drop city or null
-      dropState       — drop 2-letter state or null
-      shipper         — shipper name or null
-      consignee       — consignee name or null
-      pickupDate      — MM/DD/YY string from a "Pickup : MM/DD/YY (N items)" group header or row, or null
-      deliveryDate    — MM/DD/YY string or null
-      weight          — weight as shown (string, may include "lbs"), or null
-      customerCharges — customer charges (string), or null
-      carrierCharges  — carrier charges (string), or null
+    private static func runProcess(
+        launchPath: String,
+        arguments: [String],
+        environment: [String: String]?,
+        timeout: TimeInterval
+    ) async throws -> (status: Int32, stdout: String, stderr: String) {
+        try await withCheckedThrowingContinuation { cont in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: launchPath)
+            proc.arguments = arguments
+            // Inherit a sane PATH so claude can find node, etc.
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+            if let extra = environment {
+                for (k, v) in extra { env[k] = v }
+            }
+            proc.environment = env
 
-    Rules:
-      • Skip section header rows like "Pickup : MM/DD/YY (N items)" themselves; instead apply the
-        section's pickup date to every data row beneath it until the next section.
-      • Skip the column header row.
-      • Skip totals/footer rows.
-      • Preserve the order rows appear in the screenshot.
-      • If a cell is empty or unreadable, use null — never invent data.
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
 
-    Output: a single JSON array. Nothing else.
-    """
+            proc.terminationHandler = { p in
+                let outData = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
+                let errData = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
+                let outStr = String(data: outData ?? Data(), encoding: .utf8) ?? ""
+                let errStr = String(data: errData ?? Data(), encoding: .utf8) ?? ""
+                cont.resume(returning: (p.terminationStatus, outStr, errStr))
+            }
+            do {
+                try proc.run()
+                // Coarse timeout. If claude is still running after the deadline, kill it.
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if proc.isRunning {
+                        proc.terminate()
+                    }
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+    }
 }

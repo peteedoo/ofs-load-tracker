@@ -18,6 +18,7 @@ struct LTLView: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Spacer()
+                Button("Capture region…") { captureRegion() }
                 Button("Paste screenshot") { pasteFromPasteboard() }
                 Button("Choose file…") { chooseFile() }
                 if !store.rows.isEmpty {
@@ -120,6 +121,21 @@ struct LTLView: View {
             Task { await store.importImage(img) }
         }
     }
+    private func captureRegion() {
+        Task {
+            do {
+                let image = try await Screenshotter.captureRegion()
+                await store.importImage(image)
+            } catch Screenshotter.Error.cancelled {
+                // User hit Esc — quietly ignore.
+            } catch {
+                await MainActor.run {
+                    store.lastError = "Capture failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
 }
 
 struct LTLRow: View {
