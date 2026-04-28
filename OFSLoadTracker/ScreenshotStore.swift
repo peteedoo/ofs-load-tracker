@@ -38,20 +38,19 @@ final class ScreenshotStore: ObservableObject {
             let size = image.size
             debug = "image \(Int(size.width))x\(Int(size.height))…"
 
-            // Prefer Claude API if a key is configured — vision-model parsing
-            // beats Apple Vision + column-anchor heuristics on dense tables.
-            // Fall back to the local pipeline if Claude isn't available.
+            // Prefer Claude CLI for OCR — its vision model parses tables
+            // far better than Apple Vision + column-anchor heuristics.
+            // Falls back to the local Vision pipeline if the CLI isn't
+            // available or errors out.
             var parsed: [ScreenshotLoad] = []
             var usedClaude = false
-            if APIKey.loadClaude() != nil {
-                debug = "calling Claude API…"
-                do {
-                    parsed = try await LTLClaudeOCR.parse(image: image)
-                    usedClaude = true
-                    debug = "Claude OCR: \(parsed.count) rows"
-                } catch {
-                    debug = "Claude OCR failed (\(error.localizedDescription)) — falling back to Vision"
-                }
+            debug = "calling claude CLI…"
+            do {
+                parsed = try await LTLClaudeOCR.parse(image: image)
+                usedClaude = true
+                debug = "Claude OCR: \(parsed.count) rows"
+            } catch {
+                debug = "Claude OCR failed (\(error.localizedDescription)) — falling back to Vision"
             }
             if !usedClaude {
                 let tokens = try await LTLOCR.recognize(image: image)

@@ -1,91 +1,86 @@
 import Foundation
 import AppKit
 
-/// Claude vision OCR for TMS screenshots. Replaces the prep-claude-ocr stub.
-/// Sends the screenshot to Anthropic's API and asks for a strict JSON array
-/// of `ScreenshotLoad` rows. `ScreenshotStore` falls back to Apple Vision if
-/// this throws.
+/// Claude OCR for TMS screenshots. Shells out to the Claude Code CLI
+/// (`claude -p`) so we re-use Petee's existing login — no API key needed.
+/// `ScreenshotStore` falls back to Apple Vision if this throws.
 enum LTLClaudeOCR {
     enum Error: Swift.Error, LocalizedError {
-        case notConfigured
-        case missingAPIKey
+        case cliNotFound
         case imageEncodingFailed
-        case requestFailed(status: Int, body: String)
+        case cliFailed(status: Int32, stderr: String)
         case malformedResponse(String)
 
         var errorDescription: String? {
             switch self {
-            case .notConfigured:
-                return "Claude OCR not yet integrated (stub)."
-            case .missingAPIKey:
-                return "No Anthropic API key found."
+            case .cliNotFound:
+                return "claude CLI not found. Install with: npm i -g @anthropic-ai/claude-code (or brew install claude)."
             case .imageEncodingFailed:
-                return "Could not encode screenshot for upload."
-            case .requestFailed(let status, let body):
-                return "Claude API \(status): \(body.prefix(200))"
+                return "Could not encode screenshot."
+            case .cliFailed(let status, let stderr):
+                return "claude exited \(status): \(stderr.prefix(200))"
             case .malformedResponse(let detail):
-                return "Malformed Claude response: \(detail.prefix(200))"
+                return "Malformed CLI response: \(detail.prefix(200))"
             }
         }
     }
 
-    /// Sonnet 4.6 is the price/accuracy sweet spot for table extraction.
-    /// Override with `OFS_CLAUDE_MODEL` if you want Opus.
-    private static var model: String {
-        ProcessInfo.processInfo.environment["OFS_CLAUDE_MODEL"]
-            ?? "claude-sonnet-4-6"
+    /// Common locations where Homebrew or npm install the CLI. Probed in order.
+    private static let cliCandidates = [
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        "\(NSHomeDirectory())/.npm-global/bin/claude",
+        "\(NSHomeDirectory())/.local/bin/claude",
+    ]
+
+    private static func findCLI() -> String? {
+        for p in cliCandidates where FileManager.default.isExecutableFile(atPath: p) {
+            return p
+        }
+        return nil
     }
 
     static func parse(image: NSImage) async throws -> [ScreenshotLoad] {
-        guard let key = APIKey.loadClaude() else { throw Error.missingAPIKey }
+        guard let cli = findCLI() else { throw Error.cliNotFound }
         guard let pngData = encodePNG(image, maxLongEdge: 1800) else {
             throw Error.imageEncodingFailed
         }
-        let base64 = pngData.base64EncodedString()
 
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 8000,
-            "messages": [[
-                "role": "user",
-                "content": [
-                    [
-                        "type": "image",
-                        "source": [
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": base64
-                        ]
-                    ],
-                    [
-                        "type": "text",
-                        "text": Self.prompt
-                    ]
-                ]
-            ]]
-        ]
-        let payload = try JSONSerialization.data(withJSONObject: body)
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ofs-screenshot-\(UUID().uuidString).png")
+        try pngData.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
 
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.setValue(key, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.httpBody = payload
-        req.timeoutInterval = 90
+        let fullPrompt = "Read the image at \(tmp.path) and extract every data row. " + Self.prompt
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse else {
-            throw Error.malformedResponse("no HTTP response")
-        }
-        guard (200...299).contains(http.statusCode) else {
-            let bodyStr = String(data: data, encoding: .utf8) ?? "<no body>"
-            throw Error.requestFailed(status: http.statusCode, body: bodyStr)
-        }
+        return try await Task.detached(priority: .userInitiated) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: cli)
+            proc.arguments = ["-p", fullPrompt]
+            // Run from a writable cwd so the CLI's session/state goes somewhere
+            // sensible. tmpDir is fine for one-shot use.
+            proc.currentDirectoryURL = FileManager.default.temporaryDirectory
 
-        let text = try extractText(data)
-        let jsonData = try extractJSONArray(text)
-        return try decodeLoads(jsonData)
+            let outPipe = Pipe(), errPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
+            try proc.run()
+            proc.waitUntilExit()
+
+            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let stdout = String(data: outData, encoding: .utf8) ?? ""
+            let stderr = String(data: errData, encoding: .utf8) ?? ""
+
+            if proc.terminationStatus != 0 {
+                throw Error.cliFailed(status: proc.terminationStatus, stderr: stderr)
+            }
+            if stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw Error.malformedResponse("empty stdout (stderr: \(stderr.prefix(200)))")
+            }
+            let jsonData = try Self.extractJSONArray(stdout)
+            return try Self.decodeLoads(jsonData)
+        }.value
     }
 
     // MARK: - Encoding
@@ -118,24 +113,6 @@ enum LTLClaudeOCR {
     }
 
     // MARK: - Response parsing
-
-    private static func extractText(_ data: Data) throws -> String {
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = obj["content"] as? [[String: Any]] else {
-            let raw = String(data: data, encoding: .utf8) ?? ""
-            throw Error.malformedResponse("no content array; raw: \(raw)")
-        }
-        var combined = ""
-        for block in content {
-            if (block["type"] as? String) == "text", let t = block["text"] as? String {
-                combined += t
-            }
-        }
-        if combined.isEmpty {
-            throw Error.malformedResponse("no text block in response")
-        }
-        return combined
-    }
 
     /// Strip markdown fences and locate the outermost `[ ... ]` array.
     private static func extractJSONArray(_ text: String) throws -> Data {
