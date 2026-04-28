@@ -1,0 +1,16 @@
+# Build output
+OFS Load Tracker.app/
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Xcode (in case anyone opens this in Xcode later)
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Local caches (lives in ~/Library, not project, but just in case)
+cache.json
+screenshot.json

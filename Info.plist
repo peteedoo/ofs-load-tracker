@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>OFS Load Tracker</string>
+    <key>CFBundleDisplayName</key>
+    <string>OFS Load Tracker</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.onlinefreight.loadtracker</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>OFSLoadTracker</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>OFS Load Tracker reads your Mail inbox to surface delivery status for each load and creates draft replies on your behalf. Nothing is sent automatically.</string>
+</dict>
+</plist>
