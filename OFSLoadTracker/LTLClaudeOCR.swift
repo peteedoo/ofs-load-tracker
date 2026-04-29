@@ -1,120 +1,157 @@
 import Foundation
 import AppKit
 
-/// Claude OCR for TMS screenshots. Shells out to the Claude Code CLI
-/// (`claude -p`) so we re-use Petee's existing login — no API key needed.
-/// `ScreenshotStore` falls back to Apple Vision if this throws.
+/// Claude vision OCR for TMS screenshots, via the local `claude` CLI.
+/// Uses Petee's Claude Pro/Max subscription (no Anthropic API key required).
+///
+/// Flow:
+///   1. Encode NSImage to a temp PNG.
+///   2. Shell out to `/opt/homebrew/bin/claude -p "<prompt with @path>"`.
+///   3. Parse the stdout JSON array into [ScreenshotLoad].
+///   4. Clean up the temp file.
+///
+/// `ScreenshotStore` falls back to Apple Vision (`LTLOCR`) if this throws.
 enum LTLClaudeOCR {
     enum Error: Swift.Error, LocalizedError {
-        case cliNotFound
+        case missingCLI
         case imageEncodingFailed
         case cliFailed(status: Int32, stderr: String)
         case malformedResponse(String)
 
         var errorDescription: String? {
             switch self {
-            case .cliNotFound:
-                return "claude CLI not found. Install with: npm i -g @anthropic-ai/claude-code (or brew install claude)."
+            case .missingCLI:
+                return "Claude CLI not found. Install Claude Code (e.g. via Homebrew)."
             case .imageEncodingFailed:
-                return "Could not encode screenshot."
+                return "Could not encode screenshot for the CLI."
             case .cliFailed(let status, let stderr):
-                return "claude exited \(status): \(stderr.prefix(200))"
+                return "claude CLI exited \(status): \(stderr.prefix(300))"
             case .malformedResponse(let detail):
-                return "Malformed CLI response: \(detail.prefix(200))"
+                return "Malformed Claude response: \(detail.prefix(300))"
             }
         }
     }
 
-    /// Common locations where Homebrew or npm install the CLI. Probed in order.
-    private static let cliCandidates = [
-        "/opt/homebrew/bin/claude",
-        "/usr/local/bin/claude",
-        "\(NSHomeDirectory())/.npm-global/bin/claude",
-        "\(NSHomeDirectory())/.local/bin/claude",
-    ]
+    /// Override with `OFS_CLAUDE_MODEL` if you want Opus, etc.
+    private static var modelOverride: String? {
+        let env = ProcessInfo.processInfo.environment["OFS_CLAUDE_MODEL"]
+        return (env?.isEmpty == false) ? env : nil
+    }
 
-    private static func findCLI() -> String? {
-        for p in cliCandidates where FileManager.default.isExecutableFile(atPath: p) {
-            return p
+    /// Override with `OFS_CLAUDE_PATH` if `claude` lives elsewhere.
+    private static var cliPath: String? {
+        if let env = ProcessInfo.processInfo.environment["OFS_CLAUDE_PATH"],
+           FileManager.default.isExecutableFile(atPath: env) {
+            return env
         }
-        return nil
+        let candidates = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/claude"),
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     static func parse(image: NSImage) async throws -> [ScreenshotLoad] {
-        guard let cli = findCLI() else { throw Error.cliNotFound }
+        guard let cli = cliPath else { throw Error.missingCLI }
         guard let pngData = encodePNG(image, maxLongEdge: 1800) else {
             throw Error.imageEncodingFailed
         }
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ofs-ocr-\(UUID().uuidString).png")
+        try pngData.write(to: tmpURL)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
 
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ofs-screenshot-\(UUID().uuidString).png")
-        try pngData.write(to: tmp)
-        defer { try? FileManager.default.removeItem(at: tmp) }
+        // Build prompt. The @path tells claude to attach the PNG as image input.
+        let prompt = Self.buildPrompt(imagePath: tmpURL.path)
+        var args = ["-p", prompt, "--output-format", "text"]
+        if let model = modelOverride {
+            args.append(contentsOf: ["--model", model])
+        }
 
-        let fullPrompt = "Read the image at \(tmp.path) and extract every data row. " + Self.prompt
-
-        return try await Task.detached(priority: .userInitiated) {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: cli)
-            proc.arguments = ["-p", fullPrompt]
-            // Run from a writable cwd so the CLI's session/state goes somewhere
-            // sensible. tmpDir is fine for one-shot use.
-            proc.currentDirectoryURL = FileManager.default.temporaryDirectory
-
-            let outPipe = Pipe(), errPipe = Pipe()
-            proc.standardOutput = outPipe
-            proc.standardError = errPipe
-            try proc.run()
-            proc.waitUntilExit()
-
-            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            let stdout = String(data: outData, encoding: .utf8) ?? ""
-            let stderr = String(data: errData, encoding: .utf8) ?? ""
-
-            if proc.terminationStatus != 0 {
-                throw Error.cliFailed(status: proc.terminationStatus, stderr: stderr)
-            }
-            if stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                throw Error.malformedResponse("empty stdout (stderr: \(stderr.prefix(200)))")
-            }
-            let jsonData = try Self.extractJSONArray(stdout)
-            return try Self.decodeLoads(jsonData)
-        }.value
+        let (status, stdout, stderr) = try await runProcess(
+            launchPath: cli,
+            arguments: args,
+            // Allow claude to read the temp file.
+            environment: nil,
+            timeout: 120
+        )
+        guard status == 0 else {
+            throw Error.cliFailed(status: status, stderr: stderr)
+        }
+        let arrayData = try extractJSONArray(stdout)
+        return try decodeLoads(arrayData)
     }
 
-    // MARK: - Encoding
+    // MARK: - Prompt
+
+    private static func buildPrompt(imagePath: String) -> String {
+        // Prepend @path so claude attaches the file as image input.
+        // Keep the structured-output instructions strict and quiet.
+        return """
+        @\(imagePath)
+
+        \(Self.basePrompt)
+        """
+    }
+
+    private static let basePrompt = """
+    You are an OCR assistant for an LTL/FTL freight Transportation Management System screenshot.
+    Extract every data row from the table in the image. Return ONLY a JSON array of objects.
+    Do not include commentary, markdown fences, or any other text.
+
+    Each row object must use these exact keys (use null when absent):
+      id              — 7-digit Load ID (string of digits)
+      status          — status text (e.g. "Delivered", "In Progress (Pickup)", "Covered", "Open")
+      carrierRaw      — full carrier string as shown (e.g. "Echo Logistics (Estes Express)")
+      proNumber       — PRO / tracking number, digits only (string), or null
+      pickupCity      — pickup city or null
+      pickupState     — pickup 2-letter state or null
+      dropCity        — drop city or null
+      dropState       — drop 2-letter state or null
+      shipper         — shipper name or null
+      consignee       — consignee name or null
+      pickupDate      — MM/DD/YY string from a "Pickup : MM/DD/YY (N items)" group header or row, or null
+      deliveryDate    — MM/DD/YY string or null
+      weight          — weight as shown (string, may include "lbs"), or null
+      customerCharges — customer charge amount as shown (string, may include "$"), or null
+      carrierCharges  — carrier charge amount as shown (string, may include "$"), or null
+
+    Output: a single JSON array with one object per data row. No prose. No code fences. No leading or trailing text.
+    """
+
+    // MARK: - PNG encoding
 
     private static func encodePNG(_ image: NSImage, maxLongEdge: CGFloat) -> Data? {
+        let size = image.size
+        let longest = max(size.width, size.height)
+        let scale = longest > maxLongEdge ? maxLongEdge / longest : 1.0
+        let newSize = NSSize(width: size.width * scale, height: size.height * scale)
+
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return nil
         }
-        let w = CGFloat(cg.width), h = CGFloat(cg.height)
-        let longEdge = max(w, h)
-        let scale = longEdge > maxLongEdge ? maxLongEdge / longEdge : 1.0
-        let targetW = max(1, Int((w * scale).rounded()))
-        let targetH = max(1, Int((h * scale).rounded()))
-
-        let colorSpace = cg.colorSpace ?? CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: targetW,
-            height: targetH,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
+        guard let colorSpace = cg.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                data: nil,
+                width: Int(newSize.width),
+                height: Int(newSize.height),
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
         ctx.interpolationQuality = .high
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
-        guard let resized = ctx.makeImage() else { return nil }
-        let rep = NSBitmapImageRep(cgImage: resized)
+        ctx.draw(cg, in: CGRect(origin: .zero, size: newSize))
+        guard let scaled = ctx.makeImage() else { return nil }
+        let rep = NSBitmapImageRep(cgImage: scaled)
         return rep.representation(using: .png, properties: [:])
     }
 
-    // MARK: - Response parsing
+    // MARK: - Response parsing (same shape as the old API version)
 
-    /// Strip markdown fences and locate the outermost `[ ... ]` array.
     private static func extractJSONArray(_ text: String) throws -> Data {
         var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if let open = s.range(of: "```") {
@@ -127,7 +164,7 @@ enum LTLClaudeOCR {
         guard let start = s.firstIndex(of: "["),
               let end = s.lastIndex(of: "]"),
               start < end else {
-            throw Error.malformedResponse("no JSON array in: \(s.prefix(200))")
+            throw Error.malformedResponse("no JSON array in: \(s.prefix(300))")
         }
         let slice = String(s[start...end])
         guard let data = slice.data(using: .utf8) else {
@@ -191,36 +228,49 @@ enum LTLClaudeOCR {
         return nil
     }
 
-    private static let prompt = """
-    You are an OCR assistant for an LTL/FTL freight Transportation Management System screenshot.
-    Extract every data row from the table in the image. Return ONLY a JSON array of objects.
-    Do not include commentary, markdown fences, or any other text.
+    // MARK: - Process runner
 
-    Each row object must use these exact keys (use null when absent):
-      id              — 7-digit Load ID (string of digits)
-      status          — status text (e.g. "Delivered", "In Progress (Pickup)", "Covered", "Open")
-      carrierRaw      — full carrier string as shown (e.g. "Echo Logistics (Estes Express)")
-      proNumber       — PRO / tracking number, digits only (string), or null
-      pickupCity      — pickup city or null
-      pickupState     — pickup 2-letter state or null
-      dropCity        — drop city or null
-      dropState       — drop 2-letter state or null
-      shipper         — shipper name or null
-      consignee       — consignee name or null
-      pickupDate      — MM/DD/YY string from a "Pickup : MM/DD/YY (N items)" group header or row, or null
-      deliveryDate    — MM/DD/YY string or null
-      weight          — weight as shown (string, may include "lbs"), or null
-      customerCharges — customer charges (string), or null
-      carrierCharges  — carrier charges (string), or null
+    private static func runProcess(
+        launchPath: String,
+        arguments: [String],
+        environment: [String: String]?,
+        timeout: TimeInterval
+    ) async throws -> (status: Int32, stdout: String, stderr: String) {
+        try await withCheckedThrowingContinuation { cont in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: launchPath)
+            proc.arguments = arguments
+            // Inherit a sane PATH so claude can find node, etc.
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+            if let extra = environment {
+                for (k, v) in extra { env[k] = v }
+            }
+            proc.environment = env
 
-    Rules:
-      • Skip section header rows like "Pickup : MM/DD/YY (N items)" themselves; instead apply the
-        section's pickup date to every data row beneath it until the next section.
-      • Skip the column header row.
-      • Skip totals/footer rows.
-      • Preserve the order rows appear in the screenshot.
-      • If a cell is empty or unreadable, use null — never invent data.
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
 
-    Output: a single JSON array. Nothing else.
-    """
+            proc.terminationHandler = { p in
+                let outData = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
+                let errData = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
+                let outStr = String(data: outData ?? Data(), encoding: .utf8) ?? ""
+                let errStr = String(data: errData ?? Data(), encoding: .utf8) ?? ""
+                cont.resume(returning: (p.terminationStatus, outStr, errStr))
+            }
+            do {
+                try proc.run()
+                // Coarse timeout. If claude is still running after the deadline, kill it.
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if proc.isRunning {
+                        proc.terminate()
+                    }
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+    }
 }
